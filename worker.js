@@ -1,6 +1,6 @@
 // Liked Songs Sync: single-file Cloudflare Worker.
-// Needs: KV binding "STORE", variables SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET / SESSION_SECRET,
-// and a Cron Trigger (for example every 10 minutes). See README.md.
+// Needs: KV binding "STORE", secret SESSION_SECRET, and a Cron Trigger (for example every 10 minutes).
+// Every user enters their own Spotify app's Client ID and secret in the login box on the page.
 
 const API = 'https://api.spotify.com/v1';
 const TOKEN_URL = 'https://accounts.spotify.com/api/token';
@@ -66,15 +66,16 @@ const newBudget = (env) => new Budget(Number(env.SUBREQUEST_BUDGET) || DEFAULT_B
 
 /* ---------- Spotify ---------- */
 const tokenCache = new Map();
-const basicAuth = (env) => 'Basic ' + btoa(env.SPOTIFY_CLIENT_ID + ':' + env.SPOTIFY_CLIENT_SECRET);
+const basicAuth = (id, secret) => 'Basic ' + btoa(id + ':' + secret);
 
 async function accessToken(env, uid, u, B) {
   const c = tokenCache.get(uid);
   if (c && c.exp > Date.now() + 30000) return c.token;
+  const secret = await unseal(env, u.csec);
   B.spend();
   const res = await fetch(TOKEN_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth(env) },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth(u.cid, secret) },
     body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: await unseal(env, u.refresh) }),
   });
   const j = await res.json().catch(() => ({}));
@@ -295,7 +296,8 @@ export default {
       return new Response(HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
 
-    const missing = ['SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'SESSION_SECRET'].filter((k) => !env[k]);
+    const missing = [];
+    if (!env.SESSION_SECRET) missing.push('SESSION_SECRET');
     if (!env.STORE) missing.push('STORE (KV binding)');
 
     if (p === '/api/status') {
@@ -305,29 +307,57 @@ export default {
     }
     if (missing.length) return json({ error: 'Not configured: ' + missing.join(', ') }, 503);
 
-    if (method === 'GET' && p === '/login') {
-      const state = crypto.randomUUID();
+    // Starts the Spotify login using the user's own app credentials (kept encrypted for 15 minutes).
+    const startLogin = async (cid, csecSealed) => {
+      const pid = crypto.randomUUID();
+      await env.STORE.put('p:' + pid, JSON.stringify({ cid, csec: csecSealed }), { expirationTtl: 900 });
       const q = new URLSearchParams({
-        client_id: env.SPOTIFY_CLIENT_ID,
+        client_id: cid,
         response_type: 'code',
         redirect_uri: redirectUri,
         scope: SCOPES,
-        state,
+        state: pid,
       });
-      return redirect('https://accounts.spotify.com/authorize?' + q, [
-        cookie('oauth_state', await sign(env, state), secure, 600),
-      ]);
+      return {
+        url: 'https://accounts.spotify.com/authorize?' + q,
+        cookie: cookie('oauth_state', await sign(env, pid), secure, 900),
+      };
+    };
+
+    if (method === 'POST' && p === '/api/connect') {
+      if (!(request.headers.get('Content-Type') || '').includes('application/json')) {
+        return json({ error: 'JSON only' }, 415);
+      }
+      const body = await request.json().catch(() => ({}));
+      const cid = String(body.clientId || '').trim();
+      const secret = String(body.clientSecret || '').trim();
+      if (!/^[A-Za-z0-9]{20,64}$/.test(cid)) return json({ error: 'That Client ID does not look right. Copy it from your Spotify app.' }, 400);
+      if (!/^[A-Za-z0-9]{20,64}$/.test(secret)) return json({ error: 'That Client secret does not look right. Copy it from your Spotify app.' }, 400);
+      const login = await startLogin(cid, await seal(env, secret));
+      return json({ url: login.url }, 200, { 'Set-Cookie': login.cookie });
+    }
+
+    if (method === 'GET' && p === '/login') {
+      // Reconnect with the credentials already saved for this user.
+      const cur = await currentUser(env, request);
+      if (!cur || !cur.u.cid || !cur.u.csec) return redirect('/');
+      const login = await startLogin(cur.u.cid, cur.u.csec);
+      return redirect(login.url, [login.cookie]);
     }
 
     if (method === 'GET' && p === '/callback') {
       if (url.searchParams.get('error')) return redirect('/?error=denied');
-      const expected = await unsign(env, readCookies(request).oauth_state);
+      const state = url.searchParams.get('state');
       const code = url.searchParams.get('code');
-      if (!expected || expected !== url.searchParams.get('state') || !code) return redirect('/?error=state');
+      const expected = await unsign(env, readCookies(request).oauth_state);
+      if (!expected || expected !== state || !code) return redirect('/?error=state');
+      const pend = await env.STORE.get('p:' + state, 'json');
+      if (!pend) return redirect('/?error=state');
+      await env.STORE.delete('p:' + state);
 
       const tr = await fetch(TOKEN_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth(env) },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Authorization: basicAuth(pend.cid, await unseal(env, pend.csec)) },
         body: new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri }),
       });
       const t = await tr.json().catch(() => ({}));
@@ -343,6 +373,8 @@ export default {
         playlistName: 'Liked Songs (synced)',
         ...prev,
         name: me.display_name || me.id,
+        cid: pend.cid,
+        csec: pend.csec,
         refresh: await seal(env, t.refresh_token),
         needsReauth: false,
         lastError: null,
@@ -406,7 +438,7 @@ export default {
 
   // Cron Trigger: check every connected account for new likes.
   async scheduled(_event, env, ctx) {
-    if (!env.STORE || !env.SESSION_SECRET || !env.SPOTIFY_CLIENT_ID || !env.SPOTIFY_CLIENT_SECRET) return;
+    if (!env.STORE || !env.SESSION_SECRET) return;
     const B = newBudget(env);
     const list = await env.STORE.list({ prefix: 'u:' });
     for (const k of list.keys) {
@@ -473,6 +505,15 @@ const HTML = `<!doctype html>
   .banner { background: var(--panel); border: 1px solid var(--red); color: var(--red); padding: 12px 16px; border-radius: 10px; margin-bottom: 24px; }
   .setup { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 0 0 24px; font-size: .95rem; color: var(--muted); }
   .setup code { overflow-wrap: anywhere; color: var(--ink); }
+  .box { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 24px; }
+  .box h2 { font: 600 1.15rem var(--serif); margin: 0 0 12px; }
+  .box .steps { margin: 0 0 20px; padding-left: 20px; color: var(--muted); font-size: .95rem; }
+  .box .steps li { margin-bottom: 6px; }
+  .box code { color: var(--ink); overflow-wrap: anywhere; }
+  .box label { display: block; font-size: .9rem; color: var(--muted); margin-bottom: 14px; }
+  .box input { display: block; width: 100%; margin-top: 4px; font: 1rem var(--sans); padding: 10px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  .box .fine { margin: 14px 0 0; font-size: .85rem; max-width: none; }
+  .notice { border: 1px solid var(--red); color: var(--red); border-radius: 10px; padding: 10px 14px; margin-bottom: 18px; font-size: .95rem; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -482,10 +523,21 @@ const HTML = `<!doctype html>
 
   <section id="out" hidden>
     <h1>Your liked songs, kept in a playlist.</h1>
-    <p>Connect Spotify once. Your Liked Songs are copied into a playlist, and every new like is added automatically.</p>
-    <div class="setup" id="setup" hidden></div>
-    <a class="btn" id="connect" href="/login">Connect Spotify</a>
-    <p class="status" id="uriHint" style="margin-top:20px" hidden></p>
+    <p>Connect your Spotify once. Your Liked Songs are copied into a playlist, and every new like is added automatically.</p>
+    <form class="box" id="connectForm">
+      <div class="notice" id="setup" hidden></div>
+      <h2>Connect your Spotify</h2>
+      <ol class="steps">
+        <li>Create an app at <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">developer.spotify.com/dashboard</a>.</li>
+        <li>Add this Redirect URI to it: <code id="uri"></code> <button type="button" class="link" id="copyUri">Copy</button></li>
+        <li>Under User Management, add your Spotify email.</li>
+        <li>Paste the app's Client ID and Client secret below.</li>
+      </ol>
+      <label>Client ID<input id="cid" autocomplete="off" spellcheck="false" required></label>
+      <label>Client secret<input id="csec" type="password" autocomplete="off" spellcheck="false" required></label>
+      <button type="submit" id="connectBtn">Connect Spotify</button>
+      <p class="fine">Your credentials are stored encrypted so syncing can keep running. Disconnect deletes them.</p>
+    </form>
   </section>
 
   <section id="in" hidden>
@@ -564,19 +616,13 @@ function render(s) {
 
   if (!s.connected) {
     var setup = $("#setup");
-    if (s.missing && s.missing.length) {
-      setup.hidden = false;
-      setup.textContent = "Setup needed in Cloudflare: " + s.missing.join(", ") + ". See the README.";
-      $("#connect").hidden = true;
-    } else {
-      setup.hidden = true;
-      $("#connect").hidden = false;
-    }
-    if (s.redirectUri) {
-      var hint = $("#uriHint");
-      hint.hidden = false;
-      hint.textContent = "Redirect URI to add in the Spotify dashboard: " + s.redirectUri;
-    }
+    var blocked = !!(s.missing && s.missing.length);
+    setup.hidden = !blocked;
+    if (blocked) setup.textContent = "Setup needed in Cloudflare: " + s.missing.join(", ") + ". See the README.";
+    $("#cid").disabled = blocked;
+    $("#csec").disabled = blocked;
+    $("#connectBtn").disabled = blocked;
+    if (s.redirectUri) $("#uri").textContent = s.redirectUri;
     return;
   }
 
@@ -638,6 +684,22 @@ $("#auto").addEventListener("change", async function (e) {
 $("#nameForm").addEventListener("submit", async function (e) {
   e.preventDefault();
   try { render(await api("/api/settings", { playlistName: $("#nameInput").value })); } catch (err) { showError(err.message); }
+});
+$("#connectForm").addEventListener("submit", async function (e) {
+  e.preventDefault();
+  var btn = $("#connectBtn");
+  btn.disabled = true; btn.textContent = "Opening Spotify…";
+  try {
+    var r = await api("/api/connect", { clientId: $("#cid").value.trim(), clientSecret: $("#csec").value.trim() });
+    location.href = r.url;
+  } catch (err) {
+    showError(err.message);
+    btn.disabled = false; btn.textContent = "Connect Spotify";
+  }
+});
+$("#copyUri").addEventListener("click", function () {
+  if (navigator.clipboard) navigator.clipboard.writeText($("#uri").textContent);
+  this.textContent = "Copied";
 });
 $("#rescan").addEventListener("click", async function () {
   try { render(await api("/api/rescan", {})); } catch (err) { showError(err.message); }
