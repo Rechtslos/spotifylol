@@ -1,27 +1,91 @@
-# Liked Songs Sync (Cloudflare Worker)
+# Liked Songs Sync: how it works
 
-One file: `worker.js`. It serves the web page, handles the Spotify login, and a Cron Trigger keeps the playlist updated.
+A single Cloudflare Worker (`worker.js`) that keeps a Spotify playlist in sync with your Liked Songs.
+It does three jobs: it serves a small web page, it handles the Spotify login, and on a schedule it copies
+new likes into the playlist.
 
-## Setup in the Cloudflare dashboard
+## The pieces
 
-1. **Workers & Pages → Create → Hello World**, deploy it, then **Edit code**.
-2. Replace everything with the contents of `worker.js` and **Deploy**.
-3. **Storage & Databases → KV**: create a namespace (any name).
-4. Worker **Settings → Bindings → Add → KV namespace**: variable name must be exactly `STORE`.
-5. Worker **Settings → Variables and Secrets**: add
-   - `SPOTIFY_CLIENT_ID` (text)
-   - `SPOTIFY_CLIENT_SECRET` (secret)
-   - `SESSION_SECRET` (secret, any long random string)
-6. Worker **Settings → Triggers → Cron Triggers**: add `*/10 * * * *` (every 10 minutes).
-7. Open your worker URL. The page shows the exact Redirect URI. Add it in the Spotify dashboard
-   (developer.spotify.com/dashboard → your app → Settings), and add your Spotify email under **User Management**.
-8. Click **Connect Spotify**.
+| Piece | What it does |
+|---|---|
+| `fetch()` handler | Answers web requests: the page, the login flow, and the JSON API the page calls. |
+| `scheduled()` handler | Runs on the Cron Trigger (every 10 minutes) and syncs every connected account. |
+| `syncUser()` | The sync itself. Both handlers call it. |
+| KV namespace `STORE` | The only storage. Holds the account, its settings, and the list of synced songs. |
+| `HTML` constant | The whole front end (page, styles, script), served at `/`. |
 
-## Notes
+## Login flow
 
-- **Free plan:** each run makes at most 30 Spotify calls (Cloudflare allows 50). A big library is copied in batches:
-  keep the page open and it finishes on its own, or the cron continues every 10 minutes.
-  On the paid plan, add a variable `SUBREQUEST_BUDGET` (for example `500`) to copy everything in one go.
-- **Spotify:** Development Mode apps need the app owner to have Premium and allow 5 users.
-- This version only adds songs. Songs you unlike stay in the playlist.
-- Delete the playlist in Spotify and it is recreated on the next sync.
+1. `/login` creates a random `state`, stores a signed copy in a short-lived cookie, and redirects to Spotify.
+2. Spotify sends the browser back to `/callback` with a `code`.
+3. The Worker checks that `state` matches the cookie, then swaps the `code` for tokens.
+4. It reads your Spotify profile, saves the account in KV, sets a signed session cookie, and starts the first sync.
+
+The redirect URI is built from the address the page was opened on, so no base URL setting is needed.
+
+## What is stored
+
+KV holds two keys per account:
+
+- `u:<spotifyId>`: name, playlist ID, playlist name, auto-sync on or off, progress markers, last error, and the
+  Spotify refresh token. The refresh token is encrypted (AES-GCM, key derived from `SESSION_SECRET`).
+- `s:<spotifyId>`: a list of the song URIs already put in the playlist.
+
+The session cookie holds only your Spotify ID plus an HMAC signature, so it can't be forged without `SESSION_SECRET`.
+
+## How a sync works
+
+Spotify returns liked songs newest first, in pages of 50. The sync has two modes:
+
+**Copy everything (first run, or "Re-check my whole library")**
+Reads the library page by page from the start, skips songs already in the stored list, and adds the rest to the end
+of the playlist. That keeps the playlist in the same order as Liked Songs. When it reaches the last page it
+remembers the timestamp of your newest like (`cursorAt`) and switches to the next mode.
+
+**Only new likes (every run after that)**
+Reads pages from the newest like and stops as soon as it sees a song liked before `cursorAt`. Anything not in the
+stored list is new. New songs are inserted at the top of the playlist, in chunks of 100, in reverse chunk order so
+the final order still matches Liked Songs. When nothing changed this costs one request.
+
+Other rules:
+
+- **Request budget.** Cloudflare's free plan allows 50 outgoing requests per run, so each run stops at 30
+  (`SUBREQUEST_BUDGET` raises it). A big library is copied over several runs; progress is saved after each one,
+  and the page keeps calling `/api/sync` while it is open to finish faster.
+- **Lock.** A run sets a 90-second lock on the account so the cron and a button press don't run at the same time.
+- **Playlist deleted.** If adding songs returns 404, the playlist ID and stored list are cleared and a new playlist
+  is created on the next run.
+- **Tokens.** The short-lived access token is cached in memory and refreshed from the stored refresh token. If
+  Spotify rejects the refresh token, the account is marked as needing a reconnect and the cron skips it.
+- **No removals.** The sync only adds songs. Unliking a song doesn't remove it from the playlist.
+
+## Routes
+
+| Route | Purpose |
+|---|---|
+| `GET /` | The page. |
+| `GET /api/status` | Current state for the page, or which settings are missing. |
+| `GET /login`, `GET /callback` | Spotify login. |
+| `POST /api/sync` | Run a sync now. |
+| `POST /api/rescan` | Restart the full library check, then sync. |
+| `POST /api/settings` | Change auto-sync or the playlist name. |
+| `POST /api/disconnect` | Delete the account and its stored data. |
+
+POST routes require a JSON content type and a valid session cookie.
+
+## Spotify API notes
+
+- Uses `GET /me/tracks`, `POST /me/playlists`, and `POST/PUT /playlists/{id}/items`. Since February 2026 Spotify
+  renamed the older `/tracks` playlist endpoints to `/items`.
+- Song objects are read with `track ?? item` so either field name works.
+- Apps in Development Mode need the app owner to have Premium and allow 5 users.
+
+## Required settings
+
+| Name | Where | What it is |
+|---|---|---|
+| `STORE` | KV binding | The storage namespace. |
+| `SPOTIFY_CLIENT_ID` | Variable | From your Spotify app. |
+| `SPOTIFY_CLIENT_SECRET` | Secret | From your Spotify app. |
+| `SESSION_SECRET` | Secret | Any long random string. Used for cookies and encryption. |
+| `SUBREQUEST_BUDGET` | Variable, optional | Spotify calls per run. Default 30. |
