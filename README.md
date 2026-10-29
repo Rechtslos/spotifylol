@@ -16,20 +16,33 @@ new likes into the playlist.
 
 ## Login flow
 
-1. `/login` creates a random `state`, stores a signed copy in a short-lived cookie, and redirects to Spotify.
-2. Spotify sends the browser back to `/callback` with a `code`.
-3. The Worker checks that `state` matches the cookie, then swaps the `code` for tokens.
-4. It reads your Spotify profile, saves the account in KV, sets a signed session cookie, and starts the first sync.
+Every user brings their own Spotify app, so there is no shared client ID in the Worker.
 
-The redirect URI is built from the address the page was opened on, so no base URL setting is needed.
+1. On the page, the user pastes their app's Client ID and Client secret into the login box. The page shows the
+   redirect URI to add to that Spotify app.
+2. `POST /api/connect` checks the format, encrypts the secret, and saves both in KV for 15 minutes under a random
+   ID. That ID is used as the OAuth `state`, with a signed copy in a short-lived cookie. The browser is sent to Spotify.
+3. Spotify sends the browser back to `/callback` with a `code`.
+4. The Worker checks that `state` matches the cookie, loads the saved credentials, deletes that temporary record,
+   and swaps the `code` for tokens.
+5. It reads the Spotify profile, saves the account (with its credentials) in KV, sets a signed session cookie, and
+   starts the first sync.
+
+The redirect URI is built from the address the page was opened on, so no base URL setting is needed. Because each
+user has their own Spotify app, the 5-user limit of Development Mode applies per person, not to the whole site.
 
 ## What is stored
 
 KV holds two keys per account:
 
-- `u:<spotifyId>`: name, playlist ID, playlist name, auto-sync on or off, progress markers, last error, and the
-  Spotify refresh token. The refresh token is encrypted (AES-GCM, key derived from `SESSION_SECRET`).
+- `u:<spotifyId>`: name, playlist ID, playlist name, auto-sync on or off, progress markers, last error, the user's
+  Client ID, and two encrypted values: their Client secret and the Spotify refresh token (AES-GCM, key derived
+  from `SESSION_SECRET`).
 - `s:<spotifyId>`: a list of the song URIs already put in the playlist.
+
+A third, temporary key `p:<id>` holds the credentials for a login in progress and expires after 15 minutes.
+
+Whoever controls the Worker's `SESSION_SECRET` can decrypt these, so only let people use a site whose owner they trust.
 
 The session cookie holds only your Spotify ID plus an HMAC signature, so it can't be forged without `SESSION_SECRET`.
 
@@ -55,8 +68,9 @@ Other rules:
 - **Lock.** A run sets a 90-second lock on the account so the cron and a button press don't run at the same time.
 - **Playlist deleted.** If adding songs returns 404, the playlist ID and stored list are cleared and a new playlist
   is created on the next run.
-- **Tokens.** The short-lived access token is cached in memory and refreshed from the stored refresh token. If
-  Spotify rejects the refresh token, the account is marked as needing a reconnect and the cron skips it.
+- **Tokens.** The short-lived access token is cached in memory and refreshed from the stored refresh token, using
+  that user's own Client ID and secret. If Spotify rejects the refresh token, the account is marked as needing a
+  reconnect and the cron skips it. Reconnecting (`/login`) reuses the saved credentials.
 - **No removals.** The sync only adds songs. Unliking a song doesn't remove it from the playlist.
 
 ## Routes
@@ -65,27 +79,27 @@ Other rules:
 |---|---|
 | `GET /` | The page. |
 | `GET /api/status` | Current state for the page, or which settings are missing. |
-| `GET /login`, `GET /callback` | Spotify login. |
+| `POST /api/connect` | Starts a login with the Client ID and secret from the login box. |
+| `GET /login` | Reconnects a signed-in user with their saved credentials. |
+| `GET /callback` | Where Spotify sends the browser back after login. |
 | `POST /api/sync` | Run a sync now. |
 | `POST /api/rescan` | Restart the full library check, then sync. |
 | `POST /api/settings` | Change auto-sync or the playlist name. |
 | `POST /api/disconnect` | Delete the account and its stored data. |
 
-POST routes require a JSON content type and a valid session cookie.
+POST routes require a JSON content type. All except `/api/connect` also need a valid session cookie.
 
 ## Spotify API notes
 
 - Uses `GET /me/tracks`, `POST /me/playlists`, and `POST/PUT /playlists/{id}/items`. Since February 2026 Spotify
   renamed the older `/tracks` playlist endpoints to `/items`.
 - Song objects are read with `track ?? item` so either field name works.
-- Apps in Development Mode need the app owner to have Premium and allow 5 users.
+- Apps in Development Mode need the app owner to have Premium and allow 5 users. Each user's own app counts separately.
 
 ## Required settings
 
 | Name | Where | What it is |
 |---|---|---|
 | `STORE` | KV binding | The storage namespace. |
-| `SPOTIFY_CLIENT_ID` | Variable | From your Spotify app. |
-| `SPOTIFY_CLIENT_SECRET` | Secret | From your Spotify app. |
-| `SESSION_SECRET` | Secret | Any long random string. Used for cookies and encryption. |
+| `SESSION_SECRET` | Secret | Any long random string. Used for cookies and to encrypt stored credentials and tokens. |
 | `SUBREQUEST_BUDGET` | Variable, optional | Spotify calls per run. Default 30. |
