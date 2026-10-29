@@ -1,0 +1,7 @@
+{
+  "name": "spotifylol",
+  "main": "worker.js",
+  "compatibility_date": "2025-10-01",
+  "kv_namespaces": [{ "binding": "STORE" }],
+  "triggers": { "crons": ["*/10 * * * *"] }
+}
